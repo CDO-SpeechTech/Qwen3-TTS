@@ -1239,7 +1239,14 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            # [Bug Fix] logits[:, i] is already aligned with labels[:, i] — no shift needed.
+            # self.loss_function (HF ForCausalLMLoss) applies an extra internal shift,
+            # causing a 1-group misalignment and dropping the last code group from supervision.
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,

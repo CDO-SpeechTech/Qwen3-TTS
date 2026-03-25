@@ -22,3 +22,8 @@ wheels/
 .vscode/
 venv/
 env/
+
+Qwen/
+sft_output/
+samples_for_zstts
+qwen3_tts_test_voice_clone_output_wav

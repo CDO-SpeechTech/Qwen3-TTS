@@ -48,14 +48,24 @@ def train():
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_3",
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    # train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=dataset.collate_fn,
+        num_workers=4,        # 224코어 환경에서 4면 충분, 무겁지 않은 collate_fn
+        pin_memory=True,      # CPU→GPU 전송 속도 향상 (pinned memory 사용)
+        prefetch_factor=2,    # num_workers>0일 때 기본값과 동일, 명시적으로 설정
+        persistent_workers=True,  # 에폭 간 worker 재시작 오버헤드 제거
+    )
 
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
 
@@ -86,26 +96,40 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+                # [Bug Fix 1] Apply text_projection to match codec_embedding dimension.
+                # Without this, 0.6B training crashes (2048 vs 1024 mismatch) and
+                # 1.7B has a training-inference mismatch (inference always applies projection).
+                input_text_embedding = model.talker.text_projection(
+                    model.talker.model.text_embedding(input_text_ids)
+                ) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
+                # Sub-codec groups 1-15 are summed into input_embeddings at codec positions.
+                # This matches inference: at each autoregressive step the talker receives
+                # codec_hiddens.sum(1) = codec_0_embed + groups_1_15_embeds (modeling line ~1694).
                 for i in range(1, 16):
                     codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
+                # [Bug Fix 2] Pass full sequence without manual shift.
+                # HuggingFace ForCausalLM shifts labels internally (logits[:-1] vs labels[1:]).
+                # The previous code applied a manual shift here AND let HF shift again → double shift
+                # → temporal misalignment → speech gets progressively faster each epoch (Issue #179).
                 outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
+                    inputs_embeds=input_embeddings,
+                    attention_mask=attention_mask,
+                    labels=codec_0_labels,
                     output_hidden_states=True
                 )
 
+                # Select hidden states at positions just before each codec token.
+                # codec_mask marks codec[0..T-1] positions; we want the preceding hidden states.
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+                talker_hidden_states = hidden_states[:, :-1][codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)

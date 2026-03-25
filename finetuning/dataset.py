@@ -18,6 +18,7 @@ from typing import Any, List, Tuple, Union
 import librosa
 import numpy as np
 import torch
+import torchaudio
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 from torch.utils.data import Dataset
@@ -102,9 +103,13 @@ class TTSDataset(Dataset):
     
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        assert sr == 24000, "Only support 24kHz audio"
+        target_sr = 24000
+        # assert sr == 24000, "Only support 24kHz audio"
+        audio = torch.from_numpy(audio)#.unsqueeze(0), 
+        if sr != target_sr:
+            audio = torchaudio.functional.resample(audio, sr, target_sr).unsqueeze(0)
         mels = mel_spectrogram(
-            torch.from_numpy(audio).unsqueeze(0), 
+            audio,
             n_fft=1024, 
             num_mels=128, 
             sampling_rate=24000,
