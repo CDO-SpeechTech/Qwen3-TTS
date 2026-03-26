@@ -123,6 +123,8 @@ def train():
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_slot_start", type=int, default=3000,
                         help="codec_embedding 슬롯 시작 위치. 여러 fine-tuned 모델을 합칠 때 충돌 방지용.")
+    parser.add_argument("--max_seq_length", type=int, default=0,
+                        help="이 값을 초과하는 audio_codes 길이의 샘플 제외. 0=제한 없음.")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -150,6 +152,13 @@ def train():
         f"슬롯 {args.speaker_slot_start}~{vocab_size-1} 중 "
         f"{vocab_size - args.speaker_slot_start}개만 가용 가능."
     )
+
+    # 긴 시퀀스 필터링
+    if args.max_seq_length > 0:
+        before = len(train_data)
+        train_data = [item for item in train_data if len(item["audio_codes"]) <= args.max_seq_length]
+        if len(train_data) < before:
+            accelerator.print(f"{before - len(train_data)}개 샘플 제외 (audio_codes > {args.max_seq_length})")
 
     # 길이 기반 배칭: audio_codes 길이로 정렬하여 배치 내 패딩 낭비 최소화.
     # 가장 긴 메가배치를 맨 앞에 배치하여 OOM 발생 시 즉시 감지 가능.

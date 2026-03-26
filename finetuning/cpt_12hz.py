@@ -82,6 +82,8 @@ def train():
                         help="Fraction of samples to train with Pattern B (interleaved). "
                              "0.0 = all Pattern A (sequential). 0.5 = 50/50 mix.")
     parser.add_argument("--log_steps", type=int, default=10)
+    parser.add_argument("--max_seq_length", type=int, default=0,
+                        help="이 값을 초과하는 audio_codes 길이의 샘플 제외. 0=제한 없음.")
     args = parser.parse_args()
 
     accelerator = Accelerator(
@@ -100,6 +102,13 @@ def train():
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = [json.loads(l) for l in open(args.train_jsonl) if l.strip()]
+
+    # 긴 시퀀스 필터링
+    if args.max_seq_length > 0:
+        before = len(train_data)
+        train_data = [item for item in train_data if len(item["audio_codes"]) <= args.max_seq_length]
+        if len(train_data) < before:
+            accelerator.print(f"{before - len(train_data)}개 샘플 제외 (audio_codes > {args.max_seq_length})")
 
     # 길이 기반 배칭: audio_codes 길이로 정렬하여 배치 내 패딩 낭비 최소화.
     # 가장 긴 메가배치를 맨 앞에 배치하여 OOM 발생 시 즉시 감지 가능.
