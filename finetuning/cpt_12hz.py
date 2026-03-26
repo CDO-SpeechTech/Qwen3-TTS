@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import os
+import random
 import shutil
 
 import torch
@@ -99,10 +100,32 @@ def train():
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = [json.loads(l) for l in open(args.train_jsonl) if l.strip()]
+
+    # 길이 기반 배칭: audio_codes 길이로 정렬하여 배치 내 패딩 낭비 최소화.
+    # 가장 긴 메가배치를 맨 앞에 배치하여 OOM 발생 시 즉시 감지 가능.
+    lengths = [len(item["audio_codes"]) for item in train_data]
+    sorted_indices = sorted(range(len(train_data)), key=lambda i: lengths[i])
+
+    mega_size = max(args.batch_size * 50, 1)
+    mega_batches = [sorted_indices[i:i+mega_size]
+                    for i in range(0, len(sorted_indices), mega_size)]
+
+    longest_mega = mega_batches.pop()
+    random.Random(42).shuffle(mega_batches)
+    mega_batches.insert(0, longest_mega)
+
+    reordered = [idx for mb in mega_batches for idx in mb]
+    train_data = [train_data[i] for i in reordered]
+
+    accelerator.print(
+        f"길이 기반 배칭 적용: 최단 audio_codes={min(lengths)}, "
+        f"최장={max(lengths)}, 메가배치 수={len(mega_batches)}"
+    )
+
     dataset = CPTDataset(train_data, qwen3tts.processor, config)
     collate = partial(dataset.collate_fn, non_streaming_ratio=args.non_streaming_ratio)
     train_dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
+        dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
         num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True,
     )
 
