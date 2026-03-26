@@ -76,6 +76,10 @@ def train():
     num_epochs = args.num_epochs
     model.train()
 
+    # DDP 래핑 후 model.talker 등 서브모듈에 직접 접근 불가.
+    # unwrap하여 원본 모델 참조를 유지한다.
+    unwrapped = accelerator.unwrap_model(model)
+
     for epoch in range(num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
@@ -89,7 +93,7 @@ def train():
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
 
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                speaker_embedding = unwrapped.speaker_encoder(ref_mels.to(unwrapped.device).to(unwrapped.dtype)).detach()
                 if target_speaker_embedding is None:
                     target_speaker_embedding = speaker_embedding
 
@@ -99,10 +103,10 @@ def train():
                 # [Bug Fix 1] Apply text_projection to match codec_embedding dimension.
                 # Without this, 0.6B training crashes (2048 vs 1024 mismatch) and
                 # 1.7B has a training-inference mismatch (inference always applies projection).
-                input_text_embedding = model.talker.text_projection(
-                    model.talker.model.text_embedding(input_text_ids)
+                input_text_embedding = unwrapped.talker.text_projection(
+                    unwrapped.talker.model.text_embedding(input_text_ids)
                 ) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                input_codec_embedding = unwrapped.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
@@ -111,7 +115,7 @@ def train():
                 # This matches inference: at each autoregressive step the talker receives
                 # codec_hiddens.sum(1) = codec_0_embed + groups_1_15_embeds (modeling line ~1694).
                 for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                    codec_i_embedding = unwrapped.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
@@ -119,7 +123,7 @@ def train():
                 # HuggingFace ForCausalLM shifts labels internally (logits[:-1] vs labels[1:]).
                 # The previous code applied a manual shift here AND let HF shift again → double shift
                 # → temporal misalignment → speech gets progressively faster each epoch (Issue #179).
-                outputs = model.talker(
+                outputs = unwrapped.talker(
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
@@ -132,7 +136,7 @@ def train():
                 talker_hidden_states = hidden_states[:, :-1][codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                sub_talker_logits, sub_talker_loss = unwrapped.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
                 loss = outputs.loss + 0.3 * sub_talker_loss
 

@@ -191,6 +191,12 @@ def train():
     num_epochs = args.num_epochs
     model.train()
 
+    # DDP 래핑 후 model.talker 등 서브모듈에 직접 접근 불가 (.module 필요).
+    # accelerator.unwrap_model()로 원본 모델 참조를 유지한다.
+    # 이 참조를 통한 forward는 DDP의 gradient sync를 우회하지 않음 —
+    # 실제 backward는 DDP-wrapped `model`에서 수행되므로 정상 동작.
+    unwrapped = accelerator.unwrap_model(model)
+
     for epoch in range(num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
@@ -210,10 +216,10 @@ def train():
                 # [Bug Fix 1] text_projection 적용.
                 # 미적용 시 0.6B: RuntimeError(2048 vs 1024 차원 불일치),
                 # 1.7B: training-inference mismatch (추론은 항상 projection 적용).
-                input_text_embedding = model.talker.text_projection(
-                    model.talker.model.text_embedding(input_text_ids)
+                input_text_embedding = unwrapped.talker.text_projection(
+                    unwrapped.talker.model.text_embedding(input_text_ids)
                 ) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                input_codec_embedding = unwrapped.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
 
                 # per-sample 화자 임베딩 주입 (위치 6, SFT 방식)
                 # speaker_emb_cache는 학습 전 계산된 CPU 텐서이므로 gradient graph 없음
@@ -229,7 +235,7 @@ def train():
                 # Sub-codec groups 1-15를 codec 위치에 합산.
                 # 추론 시 codec_hiddens.sum(1) = codec_0_embed + groups_1_15_embeds와 일치.
                 for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                    codec_i_embedding = unwrapped.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
@@ -237,7 +243,7 @@ def train():
                 # HuggingFace ForCausalLM이 내부적으로 shift 처리.
                 # 이전 코드: 수동 shift + HF 내부 shift = 2번 shift
                 # → temporal misalignment → 학습할수록 발화가 빨라지는 현상 (Issue #179).
-                outputs = model.talker(
+                outputs = unwrapped.talker(
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
@@ -251,7 +257,7 @@ def train():
 
                 # [Bug Fix 3] forward_finetune 내부에서 F.cross_entropy 직접 사용
                 # (모델 코드에 이미 적용됨 — 학습 스크립트에서 별도 처리 불필요)
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(
+                sub_talker_logits, sub_talker_loss = unwrapped.talker.forward_sub_talker_finetune(
                     talker_codec_ids, talker_hidden_states
                 )
 

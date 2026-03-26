@@ -127,6 +127,10 @@ def train():
     global_step = 0
     model.train()
 
+    # DDP 래핑 후 model.talker 등 서브모듈에 직접 접근 불가.
+    # unwrap하여 원본 모델 참조를 유지한다.
+    unwrapped = accelerator.unwrap_model(model)
+
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
@@ -144,8 +148,8 @@ def train():
                 B = input_ids.shape[0]
 
                 # ── Speaker embedding (self-reference, jointly trained) ───────────
-                speaker_embedding = model.speaker_encoder(
-                    ref_mels.to(model.device).to(model.dtype)
+                speaker_embedding = unwrapped.speaker_encoder(
+                    ref_mels.to(unwrapped.device).to(unwrapped.dtype)
                 )  # (B, 1024) — NO .detach(), jointly trained
 
                 # ── Text embeddings with text_projection [Bug Fix 1] ─────────────
@@ -153,14 +157,14 @@ def train():
                 # text_embedding: (vocab) → text_hidden_size (2048 for 1.7B)
                 # text_projection: text_hidden_size → hidden_size (1024)
                 input_text_ids = input_ids[:, :, 0]
-                input_text_embedding = model.talker.text_projection(
-                    model.talker.model.text_embedding(input_text_ids)
+                input_text_embedding = unwrapped.talker.text_projection(
+                    unwrapped.talker.model.text_embedding(input_text_ids)
                 ) * text_embedding_mask  # (B, T, 1024)
 
                 # ── Codec embeddings ─────────────────────────────────────────────
                 input_codec_ids = input_ids[:, :, 1]
                 input_codec_embedding = (
-                    model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                    unwrapped.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 )  # (B, T, 1024); spk_pos is zeroed by codec_embedding_mask=False
 
                 # Inject speaker embedding at per-sample speaker positions
@@ -176,7 +180,7 @@ def train():
                 # This matches inference: at each autoregressive step the talker receives
                 # codec_hiddens.sum(1) = codec_0_embed + groups_1_15_embeds (modeling line ~1694).
                 for grp in range(1, num_code_groups):
-                    codec_grp_emb = model.talker.code_predictor.get_input_embeddings()[grp - 1](
+                    codec_grp_emb = unwrapped.talker.code_predictor.get_input_embeddings()[grp - 1](
                         codec_ids[:, :, grp]
                     )
                     input_embeddings = input_embeddings + codec_grp_emb * codec_mask.unsqueeze(-1)
@@ -184,7 +188,7 @@ def train():
                 # ── Talker forward (teacher-forcing) [Bug Fix 2] ─────────────────
                 # Bug Fix 2: pass full sequence without manual shift.
                 # HF ForCausalLM handles the shift internally (logits[:-1] vs labels[1:]).
-                outputs = model.talker(
+                outputs = unwrapped.talker(
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
@@ -199,7 +203,7 @@ def train():
                 talker_hidden = hidden_states[:, :-1][codec_mask[:, 1:]]  # (N_valid, D)
                 talker_codec_ids = codec_ids[codec_mask]                   # (N_valid, G)
 
-                _, sub_talker_loss = model.talker.forward_sub_talker_finetune(
+                _, sub_talker_loss = unwrapped.talker.forward_sub_talker_finetune(
                     talker_codec_ids, talker_hidden
                 )
 
