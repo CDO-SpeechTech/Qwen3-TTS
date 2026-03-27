@@ -16,7 +16,6 @@
 import argparse
 import json
 import os
-import random
 import shutil
 from collections import defaultdict
 
@@ -125,6 +124,8 @@ def train():
                         help="codec_embedding 슬롯 시작 위치. 여러 fine-tuned 모델을 합칠 때 충돌 방지용.")
     parser.add_argument("--max_seq_length", type=int, default=0,
                         help="이 값을 초과하는 audio_codes 길이의 샘플 제외. 0=제한 없음.")
+    parser.add_argument("--max_tokens", type=int, default=0,
+                        help="Dynamic batching 토큰 예산. 0이면 --batch_size + 랜덤 셔플 사용.")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -160,38 +161,40 @@ def train():
         if len(train_data) < before:
             accelerator.print(f"{before - len(train_data)}개 샘플 제외 (audio_codes > {args.max_seq_length})")
 
-    # 길이 기반 배칭: audio_codes 길이로 정렬하여 배치 내 패딩 낭비 최소화.
-    # 가장 긴 메가배치를 맨 앞에 배치하여 OOM 발생 시 즉시 감지 가능.
     lengths = [len(item["audio_codes"]) for item in train_data]
-    sorted_indices = sorted(range(len(train_data)), key=lambda i: lengths[i])
-
-    mega_size = max(args.batch_size * 50, 1)
-    mega_batches = [sorted_indices[i:i+mega_size]
-                    for i in range(0, len(sorted_indices), mega_size)]
-
-    longest_mega = mega_batches.pop()  # 정렬 기준 가장 긴 그룹
-    random.Random(42).shuffle(mega_batches)
-    mega_batches.insert(0, longest_mega)  # 맨 앞에 배치
-
-    reordered = [idx for mb in mega_batches for idx in mb]
-    train_data = [train_data[i] for i in reordered]
-
-    accelerator.print(
-        f"길이 기반 배칭 적용: 최단 audio_codes={min(lengths)}, "
-        f"최장={max(lengths)}, 메가배치 수={len(mega_batches)}"
-    )
-
     dataset = MultiSpeakerTTSDataset(train_data, qwen3tts.processor, config)
-    train_dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # 길이 기반 정렬 유지
-        collate_fn=dataset.collate_fn,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True,
-    )
+
+    if args.max_tokens > 0:
+        from dynamic_batch_sampler import DynamicBatchSampler
+        batch_sampler = DynamicBatchSampler(
+            lengths=lengths, max_tokens=args.max_tokens, shuffle=True, seed=42,
+        )
+        accelerator.print(
+            f"Dynamic batching 적용: max_tokens={args.max_tokens}, "
+            f"최단={min(lengths)}, 최장={max(lengths)}, "
+            f"배치 수={len(batch_sampler)}"
+        )
+        train_dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=dataset.collate_fn,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
+    else:
+        batch_sampler = None
+        train_dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=dataset.collate_fn,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
 
     # speaker_encoder는 학습 루프 forward pass에서 호출되지 않으므로 freeze.
     # - DDP는 requires_grad=True 파라미터만 gradient sync를 기다리므로,
@@ -235,6 +238,9 @@ def train():
     unwrapped = accelerator.unwrap_model(model)
 
     for epoch in range(num_epochs):
+        if batch_sampler is not None:
+            batch_sampler.set_epoch(epoch)
+
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
