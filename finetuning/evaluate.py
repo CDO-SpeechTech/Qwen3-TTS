@@ -7,7 +7,7 @@
 
 추가 설치:
   pip install faster-whisper          # CER (ASR)
-  pip install discrete-speech-metrics # SpeechBERTScore
+  pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
   pip install speechbrain             # SECS (WavLM SV)
 
 사용법:
