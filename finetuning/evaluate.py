@@ -121,7 +121,7 @@ def synthesize_samples(model, test_data, output_dir, language, max_new_tokens, d
 # ---------------------------------------------------------------------------
 
 def measure_cer(samples, asr_model_size="large-v3-turbo", device="cuda:0"):
-    """합성음을 ASR로 transcribe하여 CER 계산."""
+    """원음과 합성음을 모두 ASR → CER 비교. ITN 차이를 자연스럽게 상쇄."""
     from faster_whisper import WhisperModel
 
     compute_type = "float16" if "cuda" in device else "float32"
@@ -129,11 +129,14 @@ def measure_cer(samples, asr_model_size="large-v3-turbo", device="cuda:0"):
                        device_index=int(device.split(":")[1]) if ":" in device else 0,
                        compute_type=compute_type)
 
+    def transcribe(audio_path):
+        segments, _ = asr.transcribe(audio_path, language="ko")
+        return "".join(seg.text for seg in segments)
+
     for sample in samples:
-        segments, _ = asr.transcribe(sample["synth_path"], language="ko")
-        hyp = "".join(seg.text for seg in segments)
-        sample["asr_hyp"] = hyp
-        sample["cer"] = compute_cer(sample["text"], hyp)
+        sample["asr_ref"] = transcribe(sample["ref_audio"])
+        sample["asr_hyp"] = transcribe(sample["synth_path"])
+        sample["cer"] = compute_cer(sample["asr_ref"], sample["asr_hyp"])
 
     return samples
 
@@ -300,13 +303,13 @@ def main():
             print(f"\n  ASR 불일치 샘플 ({len(mismatches)}개):")
             print("  " + "-" * 70)
             for s in mismatches:
-                ref_norm = normalize_text(s["text"])
+                ref_norm = normalize_text(s["asr_ref"])
                 hyp_norm = normalize_text(s["asr_hyp"])
                 print(f"  [{s['speaker_id']}] CER={s['cer']:.4f}")
-                print(f"    정답(원본):  {s['text']}")
-                print(f"    인식(원본):  {s['asr_hyp']}")
-                print(f"    정답(정규화): {ref_norm}")
-                print(f"    인식(정규화): {hyp_norm}")
+                print(f"    원음ASR:       {s['asr_ref']}")
+                print(f"    합성ASR:       {s['asr_hyp']}")
+                print(f"    원음ASR(정규화): {ref_norm}")
+                print(f"    합성ASR(정규화): {hyp_norm}")
                 print(f"    파일: {s['synth_path']}")
                 print()
 
