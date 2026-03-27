@@ -8,7 +8,7 @@
 추가 설치:
   pip install faster-whisper          # CER (ASR)
   pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
-  pip install https://github.com/ludlows/python-pesq/archive/master.zip  # pesq (pypesq 대체)
+  pip install pesq  # pesq (pypesq 대체)
   python -c "import pesq; open(pesq.__path__[0]+'/../pypesq.py','w').write('from pesq import *\n')"  # pypesq 호환 shim
   pip install pysptk pyworld fastdtw jellyfish Levenshtein nltk  # DiscreteSpeechMetrics 기타 종속성
   # SECS: speechbrain 불필요 — transformers의 WavLM 직접 사용
@@ -300,9 +300,13 @@ def main():
             print(f"\n  ASR 불일치 샘플 ({len(mismatches)}개):")
             print("  " + "-" * 70)
             for s in mismatches:
+                ref_norm = normalize_text(s["text"])
+                hyp_norm = normalize_text(s["asr_hyp"])
                 print(f"  [{s['speaker_id']}] CER={s['cer']:.4f}")
-                print(f"    정답: {s['text']}")
-                print(f"    인식: {s['asr_hyp']}")
+                print(f"    정답(원본):  {s['text']}")
+                print(f"    인식(원본):  {s['asr_hyp']}")
+                print(f"    정답(정규화): {ref_norm}")
+                print(f"    인식(정규화): {hyp_norm}")
                 print(f"    파일: {s['synth_path']}")
                 print()
 
