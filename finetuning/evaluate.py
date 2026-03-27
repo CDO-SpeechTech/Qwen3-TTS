@@ -8,7 +8,7 @@
 추가 설치:
   pip install faster-whisper          # CER (ASR)
   pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
-  pip install speechbrain             # SECS (WavLM SV)
+  # SECS: speechbrain 불필요 — transformers의 WavLM 직접 사용
 
 사용법:
   python finetuning/evaluate.py \
@@ -136,27 +136,32 @@ def measure_cer(samples, asr_model_size="large-v3-turbo", device="cuda:0"):
 
 
 # ---------------------------------------------------------------------------
-# SECS 측정 (speechbrain WavLM-Large SV)
+# SECS 측정 (WavLM-Large + x-vector head via transformers)
 # ---------------------------------------------------------------------------
 
 def measure_secs(samples, device="cuda:0"):
-    """원음 vs 합성음의 speaker embedding cosine similarity."""
-    from speechbrain.inference.speaker import EncoderClassifier
+    """원음 vs 합성음의 speaker embedding cosine similarity.
+
+    microsoft/wavlm-large-sv (speaker verification finetuned)를 사용.
+    speechbrain 없이 transformers AutoModelForAudioXVector로 직접 로드.
+    """
+    from transformers import AutoFeatureExtractor, AutoModelForAudioXVector
     import torchaudio
 
-    classifier = EncoderClassifier.from_hparams(
-        source="microsoft/wavlm-base-plus-sv",
-        savedir="pretrained_models/wavlm-sv",
-        run_opts={"device": device},
-    )
+    model_name = "microsoft/wavlm-base-plus-sv"
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+    sv_model = AutoModelForAudioXVector.from_pretrained(model_name).to(device).eval()
 
+    @torch.no_grad()
     def get_embedding(audio_path):
         wav, sr = torchaudio.load(audio_path)
         if sr != 16000:
             wav = torchaudio.functional.resample(wav, sr, 16000)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
-        emb = classifier.encode_batch(wav.to(device))
+        inputs = feature_extractor(wav.squeeze(0).numpy(), sampling_rate=16000, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        emb = sv_model(**inputs).embeddings
         return emb.squeeze()
 
     for sample in samples:
@@ -164,6 +169,9 @@ def measure_secs(samples, device="cuda:0"):
         emb_syn = get_embedding(sample["synth_path"])
         cos_sim = torch.nn.functional.cosine_similarity(emb_ref, emb_syn, dim=0)
         sample["secs"] = cos_sim.item()
+
+    del sv_model
+    torch.cuda.empty_cache()
 
     return samples
 
