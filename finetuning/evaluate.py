@@ -8,7 +8,9 @@
 추가 설치:
   pip install faster-whisper          # CER (ASR)
   pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
-  pip install pysptk pyworld fastdtw jellyfish Levenshtein nltk  # DiscreteSpeechMetrics 종속성 (pypesq 제외)
+  pip install https://github.com/ludlows/python-pesq/archive/master.zip  # pesq (pypesq 대체)
+  python -c "import pesq; open(pesq.__path__[0]+'/../pypesq.py','w').write('from pesq import *\n')"  # pypesq 호환 shim
+  pip install pysptk pyworld fastdtw jellyfish Levenshtein nltk  # DiscreteSpeechMetrics 기타 종속성
   # SECS: speechbrain 불필요 — transformers의 WavLM 직접 사용
 
 사용법:
