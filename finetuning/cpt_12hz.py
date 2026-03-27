@@ -84,7 +84,8 @@ def train():
     parser.add_argument("--max_seq_length", type=int, default=0,
                         help="이 값을 초과하는 audio_codes 길이의 샘플 제외. 0=제한 없음.")
     parser.add_argument("--max_tokens", type=int, default=0,
-                        help="Dynamic batching 토큰 예산. 0이면 --batch_size + 랜덤 셔플 사용.")
+                        help="Dynamic batching 토큰 예산. 0이면 --batch_size 고정 크기 사용. "
+                             "활성화 시 --batch_size는 배치 내 최대 샘플 수 상한으로 동작.")
     args = parser.parse_args()
 
     accelerator = Accelerator(
@@ -118,12 +119,16 @@ def train():
     if args.max_tokens > 0:
         from dynamic_batch_sampler import DynamicBatchSampler
         batch_sampler = DynamicBatchSampler(
-            lengths=lengths, max_tokens=args.max_tokens, shuffle=True, seed=42,
+            lengths=lengths, max_tokens=args.max_tokens,
+            max_batch_size=args.batch_size, shuffle=True, seed=42,
         )
+        batch_sizes = [len(b) for b in batch_sampler._batches]
         accelerator.print(
             f"Dynamic batching 적용: max_tokens={args.max_tokens}, "
-            f"최단={min(lengths)}, 최장={max(lengths)}, "
-            f"배치 수={len(batch_sampler)}"
+            f"batch_size 상한={args.batch_size}, "
+            f"audio_codes 최단={min(lengths)}, 최장={max(lengths)}, "
+            f"배치 수={len(batch_sampler)}, "
+            f"배치 크기 범위={min(batch_sizes)}~{max(batch_sizes)}"
         )
         train_dataloader = DataLoader(
             dataset,
