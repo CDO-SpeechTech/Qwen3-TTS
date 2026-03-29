@@ -30,13 +30,20 @@ python finetuning/prepare_data.py \
   --input_jsonl train_raw.jsonl \
   --output_jsonl train_with_codes.jsonl
 
-# Step 2: SFT training
+# Step 2: SFT training (단일화자)
 python finetuning/sft_12hz.py \
   --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --output_model_path output \
   --train_jsonl train_with_codes.jsonl \
   --batch_size 32 --lr 2e-6 --num_epochs 10 \
   --speaker_name my_speaker
+
+# Step 2: SFT training (다화자 — JSONL에 speaker_id 필드 필요)
+python finetuning/sft_12hz.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output_model_path output_multi \
+  --train_jsonl train_with_codes.jsonl \
+  --batch_size 2 --lr 2e-5 --num_epochs 3
 ```
 
 ## Architecture
@@ -160,9 +167,9 @@ loss = F.cross_entropy(
 ## CPT (Continual Pre-Training) — 한국어 특화
 
 ### 파일 구성
-- `finetuning/prepare_data_cpt.py` — 오디오 tokenization (resume 지원, ref_audio 불필요)
-- `finetuning/cpt_dataset.py` — CPTDataset (Pattern A/B, Korean lang_id, instruct prefix)
-- `finetuning/cpt_12hz.py` — CPT 학습 스크립트 (Bug Fix 1-3 모두 적용)
+- `pretraining/prepare_data_cpt.py` — 오디오 tokenization (resume 지원, ref_audio 불필요)
+- `pretraining/cpt_dataset.py` — CPTDataset (Pattern A/B, Korean lang_id, instruct prefix)
+- `pretraining/cpt_12hz.py` — CPT 학습 스크립트 (Bug Fix 1-3 모두 적용)
 
 ### SFT와의 핵심 차이
 | 항목 | SFT | CPT |
@@ -176,14 +183,14 @@ loss = F.cross_entropy(
 ### CPT 실행
 ```bash
 # Step 1: 오디오 tokenization
-python finetuning/prepare_data_cpt.py \
+python pretraining/prepare_data_cpt.py \
   --device cuda:0 \
   --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
   --input_jsonl ko_raw.jsonl \
   --output_jsonl ko_with_codes.jsonl
 
 # Step 2: CPT 학습
-python finetuning/cpt_12hz.py \
+python pretraining/cpt_12hz.py \
   --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --output_model_path output_cpt \
   --train_jsonl ko_with_codes.jsonl \
