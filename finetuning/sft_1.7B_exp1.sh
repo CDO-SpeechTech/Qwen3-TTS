@@ -9,23 +9,24 @@ RAW_JSONL="train_raw.jsonl"
 TRAIN_JSONL="train_with_codes.jsonl"
 OUTPUT_DIR="sft_output/Qwen3-TTS-12Hz-1.7B-Base/exp1"
 
-BATCH_SIZE=48
+
+# 4GPU H100 settings
+N_GPUS=4
+BATCH_SIZE=32
+MAX_SEQ_LENGTH=999
+MAX_TOKENS=4000
 LR=2e-6
 EPOCHS=8
-SPEAKER_NAME="f_bomi"
 
-# python prepare_data.py \
-#   --device ${DEVICE} \
-#   --tokenizer_model_path ${TOKENIZER_MODEL_PATH} \
-#   --input_jsonl ${RAW_JSONL} \
-#   --output_jsonl ${TRAIN_JSONL}
+export NCCL_NET=Socket  # NCCL 2.27.3+ NET Plugin 초기화 실패 방지
 
-python sft_12hz.py \
+torchrun --nproc_per_node=${N_GPUS} sft_12hz.py \
   --init_model_path ${INIT_MODEL_PATH} \
   --output_model_path ${OUTPUT_DIR} \
   --train_jsonl ${TRAIN_JSONL} \
   --batch_size ${BATCH_SIZE} \
   --lr ${LR} \
   --num_epochs ${EPOCHS} \
-  --speaker_name ${SPEAKER_NAME}
+  --max_seq_length ${MAX_SEQ_LENGTH} \
+  --max_tokens ${MAX_TOKENS}
   

@@ -29,3 +29,4 @@ sft_output_multispeaker/
 samples_for_zstts/
 qwen3_tts_test_voice_clone_output_wav/
 *.wav
+eval_results/
