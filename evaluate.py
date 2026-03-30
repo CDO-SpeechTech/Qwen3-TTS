@@ -6,7 +6,7 @@
   - SpeechBERTScore: discrete_speech_metrics WavLM-Large layer 14 (content + style)
 
 추가 설치:
-  pip install faster-whisper          # CER (ASR)
+  # CER: transformers Whisper 사용 (추가 설치 불필요)
   pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
   pip install pesq  # pesq (pypesq 대체)
   python -c "import pesq; open(pesq.__path__[0]+'/../pypesq.py','w').write('from pesq import *\n')"  # pypesq 호환 shim
@@ -120,23 +120,32 @@ def synthesize_samples(model, test_data, output_dir, language, max_new_tokens, d
 # CER 측정 (faster-whisper)
 # ---------------------------------------------------------------------------
 
-def measure_cer(samples, asr_model_size="large-v3-turbo", device="cuda:0"):
+def measure_cer(samples, asr_model_name="openai/whisper-large-v3-turbo", device="cuda:0"):
     """원음과 합성음을 모두 ASR → CER 비교. ITN 차이를 자연스럽게 상쇄."""
-    from faster_whisper import WhisperModel
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    import librosa
 
-    compute_type = "float16" if "cuda" in device else "float32"
-    asr = WhisperModel(asr_model_size, device=device.split(":")[0],
-                       device_index=int(device.split(":")[1]) if ":" in device else 0,
-                       compute_type=compute_type)
+    torch_dtype = torch.float16 if "cuda" in device else torch.float32
+    asr_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        asr_model_name, torch_dtype=torch_dtype, low_cpu_mem_usage=True,
+    ).to(device).eval()
+    processor = AutoProcessor.from_pretrained(asr_model_name)
 
+    @torch.no_grad()
     def transcribe(audio_path):
-        segments, _ = asr.transcribe(audio_path, language="ko")
-        return "".join(seg.text for seg in segments)
+        wav, sr = librosa.load(audio_path, sr=16000, mono=True)
+        inputs = processor(wav, sampling_rate=16000, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        generated_ids = asr_model.generate(**inputs, language="ko", max_new_tokens=256)
+        return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
     for sample in samples:
         sample["asr_ref"] = transcribe(sample["ref_audio"])
         sample["asr_hyp"] = transcribe(sample["synth_path"])
         sample["cer"] = compute_cer(sample["asr_ref"], sample["asr_hyp"])
+
+    del asr_model
+    torch.cuda.empty_cache()
 
     return samples
 
