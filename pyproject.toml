@@ -31,6 +31,22 @@ dependencies = [
   "einops",
 ]
 
+[project.optional-dependencies]
+train = [
+  "tensorboard",
+]
+eval = [
+  "faster-whisper",
+  "pesq",
+  "pysptk",
+  "pyworld",
+  "fastdtw",
+  "jellyfish",
+  "Levenshtein",
+  "nltk",
+  "discrete-speech-metrics @ git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git",
+]
+
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-TTS"
 Repository = "https://github.com/Qwen/Qwen3-TTS"

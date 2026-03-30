@@ -76,9 +76,9 @@ def compute_cer(ref: str, hyp: str) -> float:
 # TTS 합성
 # ---------------------------------------------------------------------------
 
-def synthesize_samples(model, test_data, output_dir, checkpoint_name, language, max_new_tokens, device):
+def synthesize_samples(model, test_data, output_dir, language, max_new_tokens, device):
     """테스트 샘플별로 합성 후 wav 저장. 반환: [{...sample_info, synth_path, ref_audio_path}]"""
-    wavs_dir = os.path.join(output_dir, "wavs", checkpoint_name)
+    wavs_dir = os.path.join(output_dir, "wavs")
     results = []
 
     for idx, item in enumerate(test_data):
@@ -258,10 +258,9 @@ def main():
     parser.add_argument("--skip_sbs", action="store_true", help="SpeechBERTScore 측정 스킵")
     args = parser.parse_args()
 
-    # 체크포인트명 + 테스트셋명으로 결과 디렉토리 구분
-    checkpoint_name = os.path.basename(os.path.normpath(args.checkpoint_path))
-    test_name = os.path.splitext(os.path.basename(args.test_jsonl))[0]
-    run_dir = os.path.join(args.output_dir, f"{checkpoint_name}__{test_name}")
+    # 체크포인트 상대경로로 결과 디렉토리 구분 (서로 다른 실험의 같은 epoch 충돌 방지)
+    checkpoint_name = os.path.normpath(args.checkpoint_path).replace(os.sep, "__")
+    run_dir = os.path.join(args.output_dir, checkpoint_name)
     os.makedirs(run_dir, exist_ok=True)
 
     # 1. 테스트 데이터 로드
@@ -285,7 +284,6 @@ def main():
     print("\n=== 합성 시작 ===")
     samples = synthesize_samples(
         model, test_data, run_dir,
-        checkpoint_name=checkpoint_name,
         language=args.language,
         max_new_tokens=args.max_new_tokens,
         device=args.device,
