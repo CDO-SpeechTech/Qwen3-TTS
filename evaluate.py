@@ -10,7 +10,7 @@
   pip install --no-deps git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git  # SpeechBERTScore
   pip install pesq  # pesq (pypesq 대체)
   python -c "import pesq; open(pesq.__path__[0]+'/../pypesq.py','w').write('from pesq import *\n')"  # pypesq 호환 shim
-  pip install pysptk pyworld fastdtw jellyfish Levenshtein nltk  # DiscreteSpeechMetrics 기타 종속성
+  pip install setuptools pysptk pyworld fastdtw jellyfish Levenshtein nltk  # DiscreteSpeechMetrics 기타 종속성 (setuptools: pysptk의 pkg_resources)
   # SECS: speechbrain 불필요 — transformers의 WavLM 직접 사용
 
 사용법:
@@ -117,7 +117,7 @@ def synthesize_samples(model, test_data, output_dir, language, max_new_tokens, d
 
 
 # ---------------------------------------------------------------------------
-# CER 측정 (faster-whisper)
+# CER 측정 (transformers Whisper)
 # ---------------------------------------------------------------------------
 
 def measure_cer(samples, asr_model_name="openai/whisper-large-v3-turbo", device="cuda:0"):
@@ -135,7 +135,7 @@ def measure_cer(samples, asr_model_name="openai/whisper-large-v3-turbo", device=
     def transcribe(audio_path):
         wav, sr = librosa.load(audio_path, sr=16000, mono=True)
         inputs = processor(wav, sampling_rate=16000, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device=device, dtype=torch_dtype) if v.is_floating_point() else v.to(device) for k, v in inputs.items()}
         generated_ids = asr_model.generate(**inputs, language="ko", max_new_tokens=256)
         return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
@@ -161,7 +161,7 @@ def measure_secs(samples, device="cuda:0"):
     speechbrain 없이 transformers AutoModelForAudioXVector로 직접 로드.
     """
     from transformers import AutoFeatureExtractor, AutoModelForAudioXVector
-    import torchaudio
+    import librosa
 
     model_name = "microsoft/wavlm-base-plus-sv"
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
@@ -169,12 +169,8 @@ def measure_secs(samples, device="cuda:0"):
 
     @torch.no_grad()
     def get_embedding(audio_path):
-        wav, sr = torchaudio.load(audio_path)
-        if sr != 16000:
-            wav = torchaudio.functional.resample(wav, sr, 16000)
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        inputs = feature_extractor(wav.squeeze(0).numpy(), sampling_rate=16000, return_tensors="pt")
+        wav, _ = librosa.load(audio_path, sr=16000, mono=True)
+        inputs = feature_extractor(wav, sampling_rate=16000, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         emb = sv_model(**inputs).embeddings
         return emb.squeeze()
