@@ -81,6 +81,8 @@ def train():
                         help="Fraction of samples to train with Pattern B (interleaved). "
                              "0.0 = all Pattern A (sequential). 0.5 = 50/50 mix.")
     parser.add_argument("--log_steps", type=int, default=10)
+    parser.add_argument("--test_jsonl", type=str, default=None,
+                        help="Validation용 JSONL. 미지정 시 validation 생략.")
     parser.add_argument("--max_seq_length", type=int, default=0,
                         help="이 값을 초과하는 audio_codes 길이의 샘플 제외. 0=제한 없음.")
     parser.add_argument("--max_tokens", type=int, default=0,
@@ -92,6 +94,7 @@ def train():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16",
         log_with="tensorboard",
+        project_dir=args.output_model_path,
     )
 
     MODEL_PATH = args.init_model_path
@@ -146,6 +149,26 @@ def train():
             num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True,
         )
 
+    # Validation 데이터로더 (optional)
+    val_dataloader = None
+    if args.test_jsonl is not None:
+        test_data = [json.loads(l) for l in open(args.test_jsonl) if l.strip()]
+        if args.max_seq_length > 0:
+            test_data = [item for item in test_data if len(item["audio_codes"]) <= args.max_seq_length]
+        val_dataset = CPTDataset(test_data, qwen3tts.processor, config)
+        val_collate = partial(val_dataset.collate_fn, non_streaming_ratio=0.0)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=val_collate,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
+        accelerator.print(f"Validation 데이터: {len(test_data)}개 샘플")
+
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
 
     num_update_steps_per_epoch = math.ceil(
@@ -159,12 +182,18 @@ def train():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps
     )
 
-    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader, scheduler
-    )
+    if val_dataloader is not None:
+        model, optimizer, train_dataloader, scheduler, val_dataloader = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader, scheduler, val_dataloader
+        )
+    else:
+        model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader, scheduler
+        )
 
     num_code_groups = config.talker_config.num_code_groups
     global_step = 0
+    accelerator.init_trackers("cpt_12hz", config=vars(args))
     model.train()
 
     # DDP 래핑 후 model.talker 등 서브모듈에 직접 접근 불가.
@@ -266,6 +295,12 @@ def train():
                 global_step += 1
 
                 if global_step % args.log_steps == 0:
+                    accelerator.log({
+                        "train/loss": loss.item(),
+                        "train/talker_loss": outputs.loss.item(),
+                        "train/sub_talker_loss": sub_talker_loss.item(),
+                        "train/lr": scheduler.get_last_lr()[0],
+                    }, step=global_step)
                     accelerator.print(
                         f"Epoch {epoch} | Step {global_step} "
                         f"| Loss: {loss.item():.4f} "
@@ -289,7 +324,88 @@ def train():
                             args.output_model_path, f"checkpoint-step-{global_step}"
                         )
                         save_checkpoint(accelerator, model, config, MODEL_PATH, ckpt_dir)
+                    accelerator.end_training()
                     return
+
+        # ── Validation ──────────────────────────────────────────────────
+        if val_dataloader is not None:
+            model.eval()
+            val_total_loss = 0.0
+            val_talker_loss = 0.0
+            val_sub_talker_loss = 0.0
+            val_steps = 0
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    input_ids = batch["input_ids"]
+                    codec_ids = batch["codec_ids"]
+                    ref_mels = batch["ref_mels"]
+                    text_embedding_mask = batch["text_embedding_mask"]
+                    codec_embedding_mask = batch["codec_embedding_mask"]
+                    attention_mask = batch["attention_mask"]
+                    codec_0_labels = batch["codec_0_labels"]
+                    codec_mask = batch["codec_mask"]
+                    speaker_positions = batch["speaker_positions"]
+
+                    B = input_ids.shape[0]
+
+                    speaker_embedding = unwrapped.speaker_encoder(
+                        ref_mels.to(unwrapped.device).to(unwrapped.dtype)
+                    )
+
+                    input_text_ids = input_ids[:, :, 0]
+                    input_text_embedding = unwrapped.talker.text_projection(
+                        unwrapped.talker.model.text_embedding(input_text_ids)
+                    ) * text_embedding_mask
+
+                    input_codec_ids = input_ids[:, :, 1]
+                    input_codec_embedding = (
+                        unwrapped.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                    )
+
+                    for b_idx in range(B):
+                        input_codec_embedding[b_idx, speaker_positions[b_idx], :] = (
+                            speaker_embedding[b_idx]
+                        )
+
+                    input_embeddings = input_text_embedding + input_codec_embedding
+
+                    for grp in range(1, num_code_groups):
+                        codec_grp_emb = unwrapped.talker.code_predictor.get_input_embeddings()[grp - 1](
+                            codec_ids[:, :, grp]
+                        )
+                        input_embeddings = input_embeddings + codec_grp_emb * codec_mask.unsqueeze(-1)
+
+                    v_outputs = unwrapped.talker(
+                        inputs_embeds=input_embeddings,
+                        attention_mask=attention_mask,
+                        labels=codec_0_labels,
+                        output_hidden_states=True,
+                    )
+
+                    hidden_states = v_outputs.hidden_states[0][-1]
+                    talker_hidden = hidden_states[:, :-1][codec_mask[:, 1:]]
+                    talker_codec_ids = codec_ids[codec_mask]
+
+                    _, v_sub_loss = unwrapped.talker.forward_sub_talker_finetune(
+                        talker_codec_ids, talker_hidden
+                    )
+
+                    v_loss = v_outputs.loss + 0.3 * v_sub_loss
+                    val_total_loss += v_loss.item()
+                    val_talker_loss += v_outputs.loss.item()
+                    val_sub_talker_loss += v_sub_loss.item()
+                    val_steps += 1
+
+            if val_steps > 0:
+                accelerator.log({
+                    "val/loss": val_total_loss / val_steps,
+                    "val/talker_loss": val_talker_loss / val_steps,
+                    "val/sub_talker_loss": val_sub_talker_loss / val_steps,
+                }, step=global_step)
+                accelerator.print(
+                    f"Epoch {epoch} | Val Loss: {val_total_loss / val_steps:.4f}"
+                )
+            model.train()
 
         # Epoch-based checkpoint
         if accelerator.is_main_process:
@@ -298,6 +414,8 @@ def train():
             )
             save_checkpoint(accelerator, model, config, MODEL_PATH, ckpt_dir)
             accelerator.print(f"Saved epoch checkpoint: {ckpt_dir}")
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

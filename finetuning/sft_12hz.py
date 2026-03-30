@@ -129,9 +129,15 @@ def train():
     parser.add_argument("--max_tokens", type=int, default=0,
                         help="Dynamic batching 토큰 예산. 0이면 --batch_size 고정 크기 사용. "
                              "활성화 시 --batch_size는 배치 내 최대 샘플 수 상한으로 동작.")
+    parser.add_argument("--log_steps", type=int, default=10)
+    parser.add_argument("--test_jsonl", type=str, default=None,
+                        help="Validation용 JSONL. 미지정 시 validation 생략.")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=4, mixed_precision="bf16",
+        log_with="tensorboard", project_dir=args.output_model_path,
+    )
 
     MODEL_PATH = args.init_model_path
 
@@ -213,6 +219,28 @@ def train():
             persistent_workers=True,
         )
 
+    # Validation 데이터로더 (optional)
+    val_dataloader = None
+    if args.test_jsonl is not None:
+        test_data = [json.loads(line) for line in open(args.test_jsonl) if line.strip()]
+        if not has_speaker_id:
+            for item in test_data:
+                item["speaker_id"] = args.speaker_name
+        if args.max_seq_length > 0:
+            test_data = [item for item in test_data if len(item["audio_codes"]) <= args.max_seq_length]
+        val_dataset = TTSDataset(test_data, qwen3tts.processor, config)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=val_dataset.collate_fn,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
+        accelerator.print(f"Validation 데이터: {len(test_data)}개 샘플")
+
     # speaker_encoder는 학습 루프 forward pass에서 호출되지 않으므로 freeze.
     # - DDP는 requires_grad=True 파라미터만 gradient sync를 기다리므로,
     #   freeze하지 않으면 멀티 GPU에서 DDP가 hang됨.
@@ -224,9 +252,14 @@ def train():
                         if not n.startswith("speaker_encoder")]
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader
-    )
+    if val_dataloader is not None:
+        model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader, val_dataloader
+        )
+    else:
+        model, optimizer, train_dataloader = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader
+        )
 
     # 학습 시작 전 화자 임베딩 사전 계산.
     # accelerator.prepare() 이후 모델이 각 프로세스의 GPU에 올라간 상태이므로
@@ -244,6 +277,8 @@ def train():
     accelerator.print("speaker_encoder → CPU 이동, GPU 캐시 해제 완료.")
 
     num_epochs = args.num_epochs
+    global_step = 0
+    accelerator.init_trackers("sft_12hz", config=vars(args))
     model.train()
 
     # DDP 래핑 후 model.talker 등 서브모듈에 직접 접근 불가 (.module 필요).
@@ -322,14 +357,97 @@ def train():
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if step % 10 == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+            if accelerator.sync_gradients:
+                global_step += 1
+                if global_step % args.log_steps == 0:
+                    accelerator.log({
+                        "train/loss": loss.item(),
+                        "train/talker_loss": outputs.loss.item(),
+                        "train/sub_talker_loss": sub_talker_loss.item(),
+                    }, step=global_step)
+                    accelerator.print(
+                        f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}"
+                    )
+
+        # ── Validation ──────────────────────────────────────────────────
+        if val_dataloader is not None:
+            model.eval()
+            val_total_loss = 0.0
+            val_talker_loss = 0.0
+            val_sub_talker_loss = 0.0
+            val_steps = 0
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    input_ids            = batch['input_ids']
+                    codec_ids            = batch['codec_ids']
+                    speaker_ids          = batch['speaker_ids']
+                    text_embedding_mask  = batch['text_embedding_mask']
+                    codec_embedding_mask = batch['codec_embedding_mask']
+                    attention_mask       = batch['attention_mask']
+                    codec_0_labels       = batch['codec_0_labels']
+                    codec_mask           = batch['codec_mask']
+
+                    input_text_ids  = input_ids[:, :, 0]
+                    input_codec_ids = input_ids[:, :, 1]
+
+                    input_text_embedding = unwrapped.talker.text_projection(
+                        unwrapped.talker.model.text_embedding(input_text_ids)
+                    ) * text_embedding_mask
+                    input_codec_embedding = unwrapped.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+
+                    B = input_ids.shape[0]
+                    for b_idx in range(B):
+                        spk_emb = speaker_emb_cache[speaker_ids[b_idx]].to(
+                            input_codec_embedding.device, dtype=input_codec_embedding.dtype
+                        )
+                        input_codec_embedding[b_idx, 6, :] = spk_emb
+
+                    input_embeddings = input_text_embedding + input_codec_embedding
+
+                    for i in range(1, 16):
+                        codec_i_embedding = unwrapped.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+                        input_embeddings = input_embeddings + codec_i_embedding
+
+                    v_outputs = unwrapped.talker(
+                        inputs_embeds=input_embeddings,
+                        attention_mask=attention_mask,
+                        labels=codec_0_labels,
+                        output_hidden_states=True
+                    )
+
+                    hidden_states = v_outputs.hidden_states[0][-1]
+                    talker_hidden_states = hidden_states[:, :-1][codec_mask[:, 1:]]
+                    talker_codec_ids = codec_ids[codec_mask]
+
+                    _, v_sub_loss = unwrapped.talker.forward_sub_talker_finetune(
+                        talker_codec_ids, talker_hidden_states
+                    )
+
+                    v_loss = v_outputs.loss + 0.3 * v_sub_loss
+                    val_total_loss += v_loss.item()
+                    val_talker_loss += v_outputs.loss.item()
+                    val_sub_talker_loss += v_sub_loss.item()
+                    val_steps += 1
+
+            if val_steps > 0:
+                accelerator.log({
+                    "val/loss": val_total_loss / val_steps,
+                    "val/talker_loss": val_talker_loss / val_steps,
+                    "val/sub_talker_loss": val_sub_talker_loss / val_steps,
+                }, step=global_step)
+                accelerator.print(
+                    f"Epoch {epoch} | Val Loss: {val_total_loss / val_steps:.4f}"
+                )
+            model.train()
 
         # 모든 프로세스가 에폭을 완료할 때까지 대기 후 rank 0만 저장.
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             save_checkpoint(accelerator, model, args, speaker_emb_cache, epoch)
             accelerator.print(f"Epoch {epoch} 체크포인트 저장 완료.")
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
