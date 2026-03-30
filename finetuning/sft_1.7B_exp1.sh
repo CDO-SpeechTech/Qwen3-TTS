@@ -14,13 +14,13 @@ LR=2e-6
 EPOCHS=8
 SPEAKER_NAME="f_bomi"
 
-# python finetuning/prepare_data.py \
+# python prepare_data.py \
 #   --device ${DEVICE} \
 #   --tokenizer_model_path ${TOKENIZER_MODEL_PATH} \
 #   --input_jsonl ${RAW_JSONL} \
 #   --output_jsonl ${TRAIN_JSONL}
 
-python finetuning/sft_12hz.py \
+python sft_12hz.py \
   --init_model_path ${INIT_MODEL_PATH} \
   --output_model_path ${OUTPUT_DIR} \
   --train_jsonl ${TRAIN_JSONL} \

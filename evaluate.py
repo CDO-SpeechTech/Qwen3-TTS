@@ -14,7 +14,7 @@
   # SECS: speechbrain 불필요 — transformers의 WavLM 직접 사용
 
 사용법:
-  python finetuning/evaluate.py \
+  python evaluate.py \
     --checkpoint_path output_multi/checkpoint-epoch-2 \
     --test_jsonl test_with_codes.jsonl \
     --output_dir eval_results/ \
