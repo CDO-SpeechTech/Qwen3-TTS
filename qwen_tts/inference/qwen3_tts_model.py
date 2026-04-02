@@ -929,7 +929,9 @@ class Qwen3TTSModel:
             non_streaming_mode = False
             omit_eos = True
 
-            # Background thread: generator → queue
+            # Background thread: generator → queue (raw text only)
+            # HuggingFace Fast Tokenizer is NOT thread-safe, so tokenization
+            # must happen on the main thread (inside the callback).
             import queue, threading
             text_queue = queue.Queue()
 
@@ -937,15 +939,10 @@ class Qwen3TTSModel:
                 try:
                     for new_text in text_generator:
                         if new_text:
-                            new_input = self.processor(text=new_text, return_tensors="pt", padding=True)
-                            new_ids = new_input["input_ids"].to(self.device)
-                            new_embed = self.model.talker.text_projection(
-                                self.model.talker.get_text_embeddings()(new_ids)
-                            )
-                            text_queue.put(new_embed)
+                            text_queue.put(new_text)
                 except Exception:
                     pass
-                text_queue.put(None)
+                text_queue.put(None)  # sentinel
 
             threading.Thread(target=_consume_generator, daemon=True).start()
 
@@ -958,7 +955,7 @@ class Qwen3TTSModel:
                 if item is None:
                     _gen_done[0] = True
                     return None
-                embeds = [item]
+                text_parts = [item]
                 while not text_queue.empty():
                     try:
                         item = text_queue.get_nowait()
@@ -967,8 +964,20 @@ class Qwen3TTSModel:
                     if item is None:
                         _gen_done[0] = True
                         break
-                    embeds.append(item)
-                return torch.cat(embeds, dim=1)
+                    text_parts.append(item)
+                # Tokenize + embed on main thread (thread-safe, no special tokens)
+                combined_text = "".join(text_parts)
+                new_ids = self.processor.tokenizer(
+                    combined_text, add_special_tokens=False, return_tensors="pt",
+                )["input_ids"].to(self.device)
+                if new_ids.shape[1] == 0:
+                    if _gen_done[0]:
+                        return None
+                    return trailing_text_callback()
+                new_embed = self.model.talker.text_projection(
+                    self.model.talker.get_text_embeddings()(new_ids)
+                )
+                return new_embed
         else:
             texts = [text]
 
