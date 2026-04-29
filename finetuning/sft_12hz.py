@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 from collections import defaultdict
+from functools import partial
 
 import torch
 from accelerate import Accelerator
@@ -132,6 +133,10 @@ def train():
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Validation용 JSONL. 미지정 시 validation 생략.")
+    parser.add_argument("--non_streaming_ratio", type=float, default=0.0,
+                        help="Pattern B(인터리브, streaming-input) 사용 확률. "
+                             "0.0=전부 Pattern A (기본, backward-compatible). "
+                             "0.5=반반 혼합. 1.0=전부 Pattern B.")
     args = parser.parse_args()
 
     accelerator = Accelerator(
@@ -144,7 +149,7 @@ def train():
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_3",
+        attn_implementation="flash_attention_2",
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
@@ -182,6 +187,7 @@ def train():
 
     lengths = [len(item["audio_codes"]) for item in train_data]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    train_collate = partial(dataset.collate_fn, non_streaming_ratio=args.non_streaming_ratio)
 
     if args.max_tokens > 0:
         from dynamic_batch_sampler import DynamicBatchSampler
@@ -200,7 +206,7 @@ def train():
         train_dataloader = DataLoader(
             dataset,
             batch_sampler=batch_sampler,
-            collate_fn=dataset.collate_fn,
+            collate_fn=train_collate,
             num_workers=4,
             pin_memory=True,
             prefetch_factor=2,
@@ -212,7 +218,7 @@ def train():
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=dataset.collate_fn,
+            collate_fn=train_collate,
             num_workers=4,
             pin_memory=True,
             prefetch_factor=2,
@@ -229,11 +235,13 @@ def train():
         if args.max_seq_length > 0:
             test_data = [item for item in test_data if len(item["audio_codes"]) <= args.max_seq_length]
         val_dataset = TTSDataset(test_data, qwen3tts.processor, config)
+        # Validation은 항상 Pattern A로 고정: metric 일관성 보장.
+        val_collate = partial(val_dataset.collate_fn, non_streaming_ratio=0.0)
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=val_dataset.collate_fn,
+            collate_fn=val_collate,
             num_workers=4,
             pin_memory=True,
             prefetch_factor=2,

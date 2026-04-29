@@ -12,7 +12,7 @@ tts = Qwen3TTSModel.from_pretrained(
     MODEL_PATH,
     device_map=device,
     dtype=torch.bfloat16,
-    attn_implementation="flash_attention_3",
+    attn_implementation="flash_attention_2",
 )
 
 # 안내체 목소리
